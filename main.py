@@ -703,3 +703,151 @@ async def week(week: int, semester: str = DEFAULT_SEMESTER, xh: str = DEFAULT_XH
     full = await get_schedule(semester, xh)
     full["schedule"] = [c for c in full["schedule"] if week in c["weeks"]]
     return full
+
+# ─── ehall 通用工具 ──────────────────────────────
+
+async def use_ehall_app(app_id: str) -> httpx.AsyncClient:
+    """初始化 ehall app 会话，返回已登录的 client"""
+    cookies = load_cookies()
+    jar = httpx.Cookies()
+    for k, v in cookies.items():
+        jar.set(k, v, domain="ehall.xidian.edu.cn", path="/")
+    cl = httpx.AsyncClient(follow_redirects=True, timeout=15.0, cookies=jar,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Referer": "http://ehall.xidian.edu.cn/new/index_xd.html",
+        })
+    
+    # appShow → 302 redirect → follow it to init session
+    r = await cl.get(f"https://ehall.xidian.edu.cn/appShow?appId={app_id}",
+                     follow_redirects=False)
+    if r.status_code == 302:
+        loc = r.headers.get("location", "")
+        if loc:
+            await cl.get(loc)
+    return cl
+
+# ─── 考试安排 ────────────────────────────────────
+
+@app.get("/api/exams")
+async def get_exams(semester: str = DEFAULT_SEMESTER):
+    """考试安排查询"""
+    cl = await use_ehall_app("4768687067472349")
+    try:
+        r = await cl.post(
+            "https://ehall.xidian.edu.cn/jwapp/sys/studentWdksapApp/modules/wdksap/wdksap.do",
+            params={"XNXQDM": semester, "*order": "-KSRQ,-KSSJMS"}
+        )
+        data = r.json()
+        rows = data.get("datas", {}).get("wdksap", {}).get("rows", [])
+        
+        exams = []
+        for item in rows:
+            exams.append({
+                "name": item.get("KCM", ""),
+                "type": item.get("KSMC", ""),
+                "time": item.get("KSSJMS", ""),
+                "date": item.get("KSRQ", "")[:10],
+                "location": item.get("JASMC", ""),
+                "seat": item.get("ZWH", ""),
+                "credits": item.get("XF", ""),
+                "teacher": item.get("ZJJSXM", ""),
+            })
+        
+        # Also check unarranged exams
+        unarranged = []
+        try:
+            r2 = await cl.post(
+                "https://ehall.xidian.edu.cn/jwapp/sys/studentWdksapApp/modules/wdksap/cxyxkwapkwdkc.do",
+                params={"XNXQDM": semester}
+            )
+            d2 = r2.json()
+            unr = d2.get("datas", {}).get("cxyxkwapkwdkc", {}).get("rows", [])
+            for item in unr:
+                unarranged.append({
+                    "name": item.get("KCM", ""),
+                    "code": item.get("KCH", ""),
+                })
+        except:
+            pass
+        
+        return {
+            "semester": semester,
+            "count": len(exams),
+            "unarranged_count": len(unarranged),
+            "exams": exams,
+            "unarranged": unarranged,
+        }
+    finally:
+        await cl.aclose()
+
+# ─── 考试成绩 ────────────────────────────────────
+
+@app.get("/api/scores")
+async def get_scores(semester: str = ""):
+    """考试成绩查询"""
+    cl = await use_ehall_app("4768574631264620")
+    try:
+        query_setting = {
+            "name": "SFYX", "value": "1",
+            "linkOpt": "and", "builder": "m_value_equal",
+        }
+        
+        r = await cl.post(
+            "https://ehall.xidian.edu.cn/jwapp/sys/cjcx/modules/cjcx/xscjcx.do",
+            data={
+                "*json": 1,
+                "querySetting": json.dumps(query_setting),
+                "*order": "+XNXQDM,KCH,KXH",
+                "pageSize": 1000,
+                "pageNumber": 1,
+            }
+        )
+        data = r.json()
+        rows = data.get("datas", {}).get("xscjcx", {}).get("rows", [])
+        
+        scores = []
+        for item in rows:
+            s = {
+                "name": item.get("XSKCM", ""),
+                "score": item.get("ZCJ", ""),
+                "credit": item.get("XF", ""),
+                "gpa": item.get("XFJD", ""),
+                "semester": item.get("XNXQDM", ""),
+                "category": item.get("KCXZDM_DISPLAY", ""),
+                "type": item.get("KCLBDM_DISPLAY", ""),
+                "level": item.get("DJCJMC", ""),
+                "is_pass": item.get("SFJG", "") == "1",
+                "exam_type": item.get("KSLXDM_DISPLAY", ""),
+                "retake": item.get("CXCKDM_DISPLAY", ""),
+                "class_id": item.get("JXBID", ""),
+            }
+            scores.append(s)
+        
+        # Filter by semester if specified
+        if semester:
+            scores = [s for s in scores if s["semester"] == semester]
+        
+        # Calculate GPA
+        total_credits = sum(float(s["credit"]) for s in scores if s["credit"] and s["gpa"])
+        total_points  = sum(float(s["credit"]) * float(s["gpa"]) for s in scores if s["credit"] and s["gpa"])
+        gpa = round(total_points / total_credits, 2) if total_credits > 0 else None
+        
+        # Group by semester
+        semesters = {}
+        for s in scores:
+            sem = s["semester"]
+            if sem not in semesters:
+                semesters[sem] = {"count": 0, "credits": 0}
+            semesters[sem]["count"] += 1
+            if s["credit"]:
+                semesters[sem]["credits"] += float(s["credit"])
+        
+        return {
+            "total": len(scores),
+            "gpa": gpa,
+            "semesters": semesters,
+            "scores": scores,
+        }
+    finally:
+        await cl.aclose()
