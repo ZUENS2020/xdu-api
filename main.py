@@ -328,42 +328,6 @@ async def fetch_chaoxing_data() -> dict:
     except Exception as e:
         print(f"[chaoxing] study page fetch error: {e}")
     
-    # Extract enc/openc from each course's middle page
-    import asyncio
-    async def _extract_course_auth(courses_dict):
-        client2 = make_cx_client()
-        try:
-            for cid4, info in list(courses_dict.items())[:20]:
-                clz = info.get("clazzId", "")
-                if not clz:
-                    continue
-                try:
-                    r = await client2.get(
-                        f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={cid4}&clazzid={clz}&vc=1&cpi=482265202",
-                        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
-                        timeout=8.0,
-                    )
-                    html = r.text
-                    if html and "温馨提示" not in html:
-                        # Extract enc from URL parameter pattern
-                        enc_m = re.search(r'enc=([a-f0-9]{32})', html)
-                        if enc_m:
-                            courses_dict[cid4]["enc"] = enc_m.group(1)
-                        # Extract openc from JS variable pattern
-                        openc_m = re.search(r"openc\s*:\s*'([a-f0-9]{32})'", html)
-                        if openc_m:
-                            courses_dict[cid4]["openc"] = openc_m.group(1)
-                except Exception as ex:
-                    print(f"[chaoxing] auth extraction error for {cid4}: {ex}")
-        finally:
-            await client2.aclose()
-    
-    # _extract_course_auth is already awaited since we're in an async context
-    try:
-        await _extract_course_auth(courses)
-    except Exception as e:
-        print(f"[chaoxing] batch auth extraction error: {e}")
-    
     print(f"[chaoxing] Courses: {len(courses)}")
     
     # Step 2: Attendance & progress
@@ -606,7 +570,7 @@ async def chaoxing_courses():
 
 @app.get("/api/chaoxing/course/{course_id}/detail")
 async def chaoxing_course_detail(course_id: str):
-    """课程信息（老师、班级、进度、资料情况）"""
+    """课程信息（老师、班级、时间、简介）"""
     client = make_cx_client()
     try:
         cx = load_cx_cache()
@@ -617,28 +581,42 @@ async def chaoxing_course_detail(course_id: str):
                 break
         
         clazz_id = course_info.get("clazzId", "")
-        enc = course_info.get("enc", "26ed34065bc67efb3e329fa8c2abe1f7")
-        openc = course_info.get("openc", "e148e1ddb7dcafa2364c532028dc498a")
-        cpi = "482265202"
         
         result = {
             "courseId": course_id,
             "name": course_info.get("courseName", course_info.get("name", "")),
             "teacher": course_info.get("teacher", ""),
             "clazzId": clazz_id,
+            "clazzName": course_info.get("courseName", ""),
         }
         
-        # Try to get course data page to check if materials exist
-        if clazz_id and enc:
+        # Try to get more detail from the course middle page
+        if clazz_id:
             try:
-                url = f"https://mooc1-1.chaoxing.com/mooc-ans/coursedata?courseId={course_id}&classId={clazz_id}&ut=s&enc={enc}&cpi={cpi}&openc={openc}"
-                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}, timeout=10.0)
-                if r.status_code == 200 and "温馨提示" not in r.text and len(r.text) > 1000:
-                    result["hasContent"] = True
-                else:
-                    result["hasContent"] = False
+                r = await client.get(
+                    f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&vc=1&cpi=482265202",
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    timeout=8.0,
+                )
+                html = r.text
+                if html and "温馨提示" not in html:
+                    # Extract course metadata
+                    match = re.search(r'<title>(.*?)</title>', html)
+                    if match: result["name"] = match.group(1).replace("-首页", "")
+                    # Extract chapter count
+                    chapter_ids = set(re.findall(r'chapterId=(\d+)', html))
+                    chapter_count = len(chapter_ids)
+                    result["chapters"] = chapter_count
+                    if chapter_count > 0:
+                        result["hasContent"] = True
             except Exception as e:
-                print(f"[chaoxing] detail content check error: {e}")
+                print(f"[chaoxing] detail fetch error: {e}")
+        
+        # If no chapters found, explicitly mark no content
+        if "hasContent" not in result:
+            result["hasContent"] = False
+            if "chapters" not in result:
+                result["chapters"] = 0
         
         # Also get progress info from attendance data
         for att in cx.get("attendance", []):
@@ -657,7 +635,7 @@ async def chaoxing_course_detail(course_id: str):
 
 @app.get("/api/chaoxing/course/{course_id}/materials")
 async def chaoxing_course_materials(course_id: str):
-    """尝试获取超星课程资料（受限于页面认证，通常为空）"""
+    """课程资料列表"""
     client = make_cx_client()
     try:
         cx = load_cx_cache()
@@ -668,36 +646,33 @@ async def chaoxing_course_materials(course_id: str):
                 break
         
         clazz_id = course_info.get("clazzId", "")
-        enc = course_info.get("enc", "26ed34065bc67efb3e329fa8c2abe1f7")
-        openc = course_info.get("openc", "e148e1ddb7dcafa2364c532028dc498a")
-        cpi = "482265202"
         materials = []
         
         if clazz_id:
-            # Try the course data page with enc/openc auth
+            # Try the course middle page for materials
             try:
-                url = f"https://mooc1-1.chaoxing.com/mooc-ans/coursedata?courseId={course_id}&classId={clazz_id}&ut=s&enc={enc}&cpi={cpi}&openc={openc}"
-                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}, timeout=10.0)
+                r = await client.get(
+                    f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&vc=1&cpi=482265202",
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    timeout=10.0,
+                )
                 html = r.text
-                if r.status_code == 200 and "温馨提示" not in html and len(html) > 1000:
-                    # Try to scrape file entries from the rendered page
-                    for m in re.finditer(r'<a[^>]*href="(/mooc-ans/coursedata/download[^"]+)"[^>]*>', html):
-                        dl_url = m.group(1)
-                        full_url = f"https://mooc1-1.chaoxing.com{dl_url}" if dl_url.startswith('/') else dl_url
-                    # Check the table for content
-                    clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-                    clean = re.sub(r'<[^>]+>', ' ', clean)
-                    clean = re.sub(r'\s+', ' ', clean).strip()
-                    # If page only has default empty folder, note it
-                    if "新建文件夹" in clean and "0 KB" in clean:
-                        materials = []
-                    else:
-                        # Look for file entries in the table rows
-                        rows = re.findall(r'<td[^>]*class="num"[^>]*>(.*?)</td>', html, re.DOTALL)
-                        for row in rows:
-                            name_match = re.search(r'<a[^>]*>([^<]+)</a>', row)
-                            if name_match:
-                                materials.append({"name": name_match.group(1).strip(), "type": "unknown"})
+                if html and "温馨提示" not in html:
+                    # Parse resources links
+                    for m in re.finditer(r'<a[^>]*href="([^"]+)"[^>]*>\s*<img[^>]*src="[^"]*/(?:ppt|pdf|word|excel|zip|video|file)[^.]*\.(?:png|jpg)"[^>]*>\s*</a>\s*<p[^>]*>\s*<a[^>]*href="[^"]+"[^>]*>([^<]+)</a>', html, re.DOTALL):
+                        url = m.group(1)
+                        name = m.group(2).strip()
+                        ext = url.split('.')[-1].split('?')[0].lower() if '.' in url else ''
+                        if name and len(name) < 100:
+                            materials.append({"name": name, "url": url, "type": ext.upper() if ext else "link"})
+                    
+                    if not materials:
+                        # Fallback: find all links with file extensions
+                        for m in re.finditer(r'href="([^"]*(?:\.(?:ppt|pptx|pdf|doc|docx|zip|rar|mp4|flv|avi|xls|xlsx))[^"]*)"[^>]*>([^<]{2,80})</a>', html, re.DOTALL):
+                            url, name = m.group(1), m.group(2).strip()
+                            url = url if url.startswith('http') else f"https://mooc1-1.chaoxing.com{url}" if url.startswith('/') else url
+                            ext = url.split('.')[-1].split('?')[0].lower() if '.' in url else ''
+                            materials.append({"name": name, "url": url, "type": ext.upper() if ext else "未知"})
             except Exception as e:
                 print(f"[chaoxing] materials fetch error: {e}")
         
@@ -706,7 +681,7 @@ async def chaoxing_course_materials(course_id: str):
             "name": course_info.get("courseName", course_info.get("name", "")),
             "materials": materials,
             "material_count": len(materials),
-            "online_content": "目前没有课程资料在超星平台上。教师可能通过课堂直接分发或使用其他渠道。",
+            "note": "课程资料可能需要从浏览器访问才能获取完整内容" if not materials else "",
         }
     finally:
         await client.aclose()
