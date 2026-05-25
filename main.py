@@ -290,30 +290,43 @@ def make_cx_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(follow_redirects=True, timeout=15.0, cookies=jar)
 
 async def fetch_chaoxing_data() -> dict:
-    """从超星 API 抓取课程列表和考勤数据"""
+    """从超星抓取课程列表和考勤数据"""
     client = make_cx_client()
     
-    # Step 1: Course list
+    # Step 1: Course list from the study dashboard page
     r = await client.get(
         "https://fycourse.fanya.chaoxing.com/courselist/study",
         headers={"Host": "fycourse.fanya.chaoxing.com"},
     )
     html = r.text
     
-    courses = []
-    pattern = r'<div class="myde_course_item[^"]*"[^>]*cid="([^"]*)"[^>]*cname="([^"]*)"[^>]*>'
-    for m in re.finditer(pattern, html):
-        courses.append({"courseId": m.group(1), "courseName": m.group(2)})
+    # Parse course data from dashboard
+    courses = {}
+    for m in re.finditer(r'<div[^>]*class="myde_course_item[^"]*"[^>]*cid="([^"]*)"[^>]*cname="([^"]*)"[^>]*>', html):
+        cid = m.group(1)
+        if cid not in courses:
+            courses[cid] = {"courseId": cid, "courseName": m.group(2)}
     
-    link_pattern = r'<a[^>]*href="([^"]*)"[^>]*class="[^"]*myde_course_a[^"]*"[^>]*>'
-    for m in re.finditer(link_pattern, html):
-        href = m.group(1)
-        params = dict(re.findall(r'([\w]+)=([^&]+)', href))
-        name_match = re.search(r'cname="([^"]*)"', html[:m.start()][-200:])
-        cname = name_match.group(1) if name_match else ""
-        for c in courses:
-            if c["courseName"] == cname:
-                c.update(params)
+    # Enrich from study page (has teacher, clazzId, etc.)
+    try:
+        r2 = await client.get(
+            "https://mooc1-1.chaoxing.com/visit/courses/study",
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            timeout=10.0,
+        )
+        study_html = r2.text
+        for m in re.finditer(r'<input[^>]*name="courseId"[^>]*value="(\d+)"[^>]*>.*?<input[^>]*name="classId"[^>]*value="(\d+)"[^>]*>', study_html, re.DOTALL):
+            cid2, clz = m.group(1), m.group(2)
+            if cid2 in courses:
+                courses[cid2]["clazzId"] = clz
+                courses[cid2]["cpi"] = "482265202"
+        # Extract teacher names
+        for m in re.finditer(r'courseId="(\d+)"[^>]*>.*?<p[^>]*title="([^"]+)"[^>]*>', study_html, re.DOTALL):
+            cid3 = m.group(1)
+            if cid3 in courses and not courses[cid3].get("teacher"):
+                courses[cid3]["teacher"] = m.group(2)
+    except Exception as e:
+        print(f"[chaoxing] study page fetch error: {e}")
     
     print(f"[chaoxing] Courses: {len(courses)}")
     
@@ -535,18 +548,131 @@ async def import_chaoxing(data: ImportInput):
     d = data.data
     if "courses" in d or "attendance" in d:
         save_cx_cache(d)
-        return {"status": "ok", "courses": len(d.get("courses", [])), "attendance": len(d.get("attendance", []))}
+        raw = d.get("courses", [])
+        count = len(raw) if isinstance(raw, (list, dict)) else 0
+        return {"status": "ok", "courses": count, "attendance": len(d.get("attendance", []))}
     return {"status": "fail", "message": "缺少courses或attendance字段"}
 
 @app.get("/api/chaoxing/courses")
 async def chaoxing_courses():
     """课程列表及进度"""
     cx = load_cx_cache()
+    raw = cx.get("courses", [])
+    if isinstance(raw, dict):
+        courses = list(raw.values())
+    else:
+        courses = raw
     return {
-        "courses": cx.get("courses", []),
+        "courses": courses,
         "attendance": cx.get("attendance", []),
         "updated": cx.get("updated", ""),
     }
+
+@app.get("/api/chaoxing/course/{course_id}/detail")
+async def chaoxing_course_detail(course_id: str):
+    """课程信息（老师、班级、时间、简介）"""
+    client = make_cx_client()
+    try:
+        cx = load_cx_cache()
+        course_info = {}
+        for c in (cx.get("courses", []) if isinstance(cx.get("courses"), list) else cx.get("courses", {}).values()):
+            if isinstance(c, dict) and c.get("courseId") == course_id:
+                course_info = c
+                break
+        
+        clazz_id = course_info.get("clazzId", "")
+        
+        result = {
+            "courseId": course_id,
+            "name": course_info.get("courseName", course_info.get("name", "")),
+            "teacher": course_info.get("teacher", ""),
+            "clazzId": clazz_id,
+            "clazzName": course_info.get("courseName", ""),
+        }
+        
+        # Try to get more detail from the course middle page
+        if clazz_id:
+            try:
+                r = await client.get(
+                    f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&vc=1&cpi=482265202",
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    timeout=10.0,
+                )
+                html = r.text
+                if html and "温馨提示" not in html:
+                    # Extract course metadata
+                    match = re.search(r'<title>(.*?)</title>', html)
+                    if match: result["name"] = match.group(1).replace("-首页", "")
+            except Exception as e:
+                print(f"[chaoxing] detail fetch error: {e}")
+        
+        # Also get progress info from attendance data
+        for att in cx.get("attendance", []):
+            if isinstance(att, dict) and att.get("courseName", "") == result["name"]:
+                result["progress"] = {
+                    "task": att.get("taskProgress", ""),
+                    "homework": att.get("homeworkProgress", ""),
+                    "exam": att.get("examProgress", ""),
+                    "accessCount": att.get("accessCount", ""),
+                }
+                break
+        
+        return result
+    finally:
+        await client.aclose()
+
+@app.get("/api/chaoxing/course/{course_id}/materials")
+async def chaoxing_course_materials(course_id: str):
+    """课程资料列表"""
+    client = make_cx_client()
+    try:
+        cx = load_cx_cache()
+        course_info = {}
+        for c in (cx.get("courses", []) if isinstance(cx.get("courses"), list) else cx.get("courses", {}).values()):
+            if isinstance(c, dict) and c.get("courseId") == course_id:
+                course_info = c
+                break
+        
+        clazz_id = course_info.get("clazzId", "")
+        materials = []
+        
+        if clazz_id:
+            # Try the course middle page for materials
+            try:
+                r = await client.get(
+                    f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&vc=1&cpi=482265202",
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    timeout=10.0,
+                )
+                html = r.text
+                if html and "温馨提示" not in html:
+                    # Parse resources links
+                    for m in re.finditer(r'<a[^>]*href="([^"]+)"[^>]*>\s*<img[^>]*src="[^"]*/(?:ppt|pdf|word|excel|zip|video|file)[^.]*\.(?:png|jpg)"[^>]*>\s*</a>\s*<p[^>]*>\s*<a[^>]*href="[^"]+"[^>]*>([^<]+)</a>', html, re.DOTALL):
+                        url = m.group(1)
+                        name = m.group(2).strip()
+                        ext = url.split('.')[-1].split('?')[0].lower() if '.' in url else ''
+                        if name and len(name) < 100:
+                            materials.append({"name": name, "url": url, "type": ext.upper() if ext else "link"})
+                    
+                    if not materials:
+                        # Fallback: find all links with file extensions
+                        for m in re.finditer(r'href="([^"]*(?:\.(?:ppt|pptx|pdf|doc|docx|zip|rar|mp4|flv|avi|xls|xlsx))[^"]*)"[^>]*>([^<]{2,80})</a>', html, re.DOTALL):
+                            url, name = m.group(1), m.group(2).strip()
+                            url = url if url.startswith('http') else f"https://mooc1-1.chaoxing.com{url}" if url.startswith('/') else url
+                            ext = url.split('.')[-1].split('?')[0].lower() if '.' in url else ''
+                            materials.append({"name": name, "url": url, "type": ext.upper() if ext else "未知"})
+            except Exception as e:
+                print(f"[chaoxing] materials fetch error: {e}")
+        
+        return {
+            "courseId": course_id,
+            "name": course_info.get("courseName", course_info.get("name", "")),
+            "materials": materials,
+            "material_count": len(materials),
+            "note": "课程资料可能需要从浏览器访问才能获取完整内容" if not materials else "",
+        }
+    finally:
+        await client.aclose()
 
 @app.get("/api/chaoxing/homework")
 async def chaoxing_homework():
