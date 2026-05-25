@@ -18,6 +18,8 @@ IDS_BASE = "https://ids.xidian.edu.cn"
 APP_ID = "4770397878132218"
 COOKIE_FILE = os.environ.get("COOKIE_FILE", "/tmp/xdu-cookies.json")
 CACHE_FILE = os.environ.get("COOKIE_FILE", "/data/cookies.json").replace("cookies.json", "schedule_data.json")
+EXAM_CACHE_FILE = os.environ.get("COOKIE_FILE", "/data/cookies.json").replace("cookies.json", "exam_cache.json")
+SCORE_CACHE_FILE = os.environ.get("COOKIE_FILE", "/data/cookies.json").replace("cookies.json", "score_cache.json")
 DEFAULT_SEMESTER = "2025-2026-2"
 DEFAULT_XH = "25009290006"
 DEFAULT_UN = "25009290006"
@@ -227,6 +229,30 @@ def load_cache() -> dict:
 
 def save_cache(data: dict):
     path = CACHE_FILE
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    json.dump(data, open(path, "w"), ensure_ascii=False)
+
+def load_exam_cache() -> dict:
+    f = EXAM_CACHE_FILE if os.path.exists(EXAM_CACHE_FILE) else None
+    if f:
+        try: return json.load(open(f))
+        except: pass
+    return {}
+
+def save_exam_cache(data: dict):
+    path = EXAM_CACHE_FILE
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    json.dump(data, open(path, "w"), ensure_ascii=False)
+
+def load_score_cache() -> dict:
+    f = SCORE_CACHE_FILE if os.path.exists(SCORE_CACHE_FILE) else None
+    if f:
+        try: return json.load(open(f))
+        except: pass
+    return {}
+
+def save_score_cache(data: dict):
+    path = SCORE_CACHE_FILE
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     json.dump(data, open(path, "w"), ensure_ascii=False)
 
@@ -729,9 +755,26 @@ async def use_ehall_app(app_id: str) -> httpx.AsyncClient:
 
 # ─── 考试安排 ────────────────────────────────────
 
+def merge_exam_result(exams, unarranged, semester):
+    return {
+        "semester": semester,
+        "count": len(exams),
+        "unarranged_count": len(unarranged),
+        "exams": exams,
+        "unarranged": unarranged,
+        "updated": datetime.datetime.now().isoformat(),
+    }
+
 @app.get("/api/exams")
-async def get_exams(semester: str = DEFAULT_SEMESTER):
+async def get_exams(semester: str = DEFAULT_SEMESTER, refresh: bool = False):
     """考试安排查询"""
+    cache = load_exam_cache()
+    cached = cache.get(semester)
+    if cached and not refresh:
+        age = (datetime.datetime.now() - datetime.datetime.fromisoformat(cached["updated"])).total_seconds()
+        if age < 1800:
+            return cached
+    
     cl = await use_ehall_app("4768687067472349")
     try:
         r = await cl.post(
@@ -740,7 +783,6 @@ async def get_exams(semester: str = DEFAULT_SEMESTER):
         )
         data = r.json()
         rows = data.get("datas", {}).get("wdksap", {}).get("rows", [])
-        
         exams = []
         for item in rows:
             exams.append({
@@ -754,7 +796,6 @@ async def get_exams(semester: str = DEFAULT_SEMESTER):
                 "teacher": item.get("ZJJSXM", ""),
             })
         
-        # Also check unarranged exams
         unarranged = []
         try:
             r2 = await cl.post(
@@ -764,90 +805,69 @@ async def get_exams(semester: str = DEFAULT_SEMESTER):
             d2 = r2.json()
             unr = d2.get("datas", {}).get("cxyxkwapkwdkc", {}).get("rows", [])
             for item in unr:
-                unarranged.append({
-                    "name": item.get("KCM", ""),
-                    "code": item.get("KCH", ""),
-                })
+                unarranged.append({"name": item.get("KCM", ""), "code": item.get("KCH", "")})
         except:
             pass
         
-        return {
-            "semester": semester,
-            "count": len(exams),
-            "unarranged_count": len(unarranged),
-            "exams": exams,
-            "unarranged": unarranged,
-        }
+        result = merge_exam_result(exams, unarranged, semester)
+        cache[semester] = result
+        save_exam_cache(cache)
+        return result
     finally:
         await cl.aclose()
 
 # ─── 考试成绩 ────────────────────────────────────
 
+def merge_score_result(scores, semester):
+    total_credits = sum(float(s["credit"]) for s in scores if s["credit"] and s["gpa"])
+    total_points  = sum(float(s["credit"]) * float(s["gpa"]) for s in scores if s["credit"] and s["gpa"])
+    gpa = round(total_points / total_credits, 2) if total_credits > 0 else None
+    semesters = {}
+    for s in scores:
+        sem = s["semester"]
+        if sem not in semesters:
+            semesters[sem] = {"count": 0, "credits": 0}
+        semesters[sem]["count"] += 1
+        if s["credit"]:
+            semesters[sem]["credits"] += float(s["credit"])
+    return {"total": len(scores), "gpa": gpa, "semesters": semesters, "scores": scores, "updated": datetime.datetime.now().isoformat()}
+
 @app.get("/api/scores")
-async def get_scores(semester: str = ""):
+async def get_scores(semester: str = "", refresh: bool = False):
     """考试成绩查询"""
+    cache = load_score_cache()
+    cached = cache.get("all")
+    if cached and not refresh:
+        age = (datetime.datetime.now() - datetime.datetime.fromisoformat(cached["updated"])).total_seconds()
+        if age < 3600:
+            s_list = cached["scores"]
+            if semester:
+                s_list = [s for s in s_list if s["semester"] == semester]
+            return merge_score_result(s_list, semester)
+    
     cl = await use_ehall_app("4768574631264620")
     try:
-        query_setting = {
-            "name": "SFYX", "value": "1",
-            "linkOpt": "and", "builder": "m_value_equal",
-        }
-        
+        query_setting = {"name": "SFYX", "value": "1", "linkOpt": "and", "builder": "m_value_equal"}
         r = await cl.post(
             "https://ehall.xidian.edu.cn/jwapp/sys/cjcx/modules/cjcx/xscjcx.do",
-            data={
-                "*json": 1,
-                "querySetting": json.dumps(query_setting),
-                "*order": "+XNXQDM,KCH,KXH",
-                "pageSize": 1000,
-                "pageNumber": 1,
-            }
+            data={"*json": 1, "querySetting": json.dumps(query_setting), "*order": "+XNXQDM,KCH,KXH", "pageSize": 1000, "pageNumber": 1}
         )
-        data = r.json()
-        rows = data.get("datas", {}).get("xscjcx", {}).get("rows", [])
-        
-        scores = []
+        rows = r.json().get("datas", {}).get("xscjcx", {}).get("rows", [])
+        all_scores = []
         for item in rows:
-            s = {
-                "name": item.get("XSKCM", ""),
-                "score": item.get("ZCJ", ""),
-                "credit": item.get("XF", ""),
-                "gpa": item.get("XFJD", ""),
-                "semester": item.get("XNXQDM", ""),
-                "category": item.get("KCXZDM_DISPLAY", ""),
-                "type": item.get("KCLBDM_DISPLAY", ""),
-                "level": item.get("DJCJMC", ""),
-                "is_pass": item.get("SFJG", "") == "1",
-                "exam_type": item.get("KSLXDM_DISPLAY", ""),
-                "retake": item.get("CXCKDM_DISPLAY", ""),
+            all_scores.append({
+                "name": item.get("XSKCM", ""), "score": item.get("ZCJ", ""), "credit": item.get("XF", ""),
+                "gpa": item.get("XFJD", ""), "semester": item.get("XNXQDM", ""),
+                "category": item.get("KCXZDM_DISPLAY", ""), "type": item.get("KCLBDM_DISPLAY", ""),
+                "level": item.get("DJCJMC", ""), "is_pass": item.get("SFJG", "") == "1",
+                "exam_type": item.get("KSLXDM_DISPLAY", ""), "retake": item.get("CXCKDM_DISPLAY", ""),
                 "class_id": item.get("JXBID", ""),
-            }
-            scores.append(s)
-        
-        # Filter by semester if specified
+            })
+        all_result = merge_score_result(all_scores, "")
+        cache["all"] = all_result
+        save_score_cache(cache)
         if semester:
-            scores = [s for s in scores if s["semester"] == semester]
-        
-        # Calculate GPA
-        total_credits = sum(float(s["credit"]) for s in scores if s["credit"] and s["gpa"])
-        total_points  = sum(float(s["credit"]) * float(s["gpa"]) for s in scores if s["credit"] and s["gpa"])
-        gpa = round(total_points / total_credits, 2) if total_credits > 0 else None
-        
-        # Group by semester
-        semesters = {}
-        for s in scores:
-            sem = s["semester"]
-            if sem not in semesters:
-                semesters[sem] = {"count": 0, "credits": 0}
-            semesters[sem]["count"] += 1
-            if s["credit"]:
-                semesters[sem]["credits"] += float(s["credit"])
-        
-        return {
-            "total": len(scores),
-            "gpa": gpa,
-            "semesters": semesters,
-            "scores": scores,
-        }
+            all_scores = [s for s in all_scores if s["semester"] == semester]
+        return merge_score_result(all_scores, semester)
     finally:
         await cl.aclose()
