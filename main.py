@@ -43,137 +43,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
 }
 
-AES_CHARS = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678"
-
-# ─── 滑块验证码破解 ─────────────────────────────
-
-class SliderCaptchaSolver:
-    """
-    XDYou 滑块验证码自动破解
-    流程: openSliderCaptcha.htl → tagWidth → generateTracks → AES加密 → verifySliderCaptcha.htl
-    """
-    
-    @staticmethod
-    def random_str(n: int) -> str:
-        return ''.join(random.choice(AES_CHARS) for _ in range(n))
-    
-    @staticmethod
-    def extract_aes_key(image_data: bytes) -> bytes:
-        """图片最后 16 字节是 AES 密钥"""
-        return image_data[-16:]
-    
-    @staticmethod
-    def aes_encrypt(plain_text: str, key_bytes: bytes) -> str:
-        """
-        XDYou 的 AES-CBC 加密
-        IV = random 16 chars
-        payload = nonce(64 chars) + plain_text
-        """
-        iv_str = SliderCaptchaSolver.random_str(16)
-        nonce = SliderCaptchaSolver.random_str(64)
-        plain = (nonce + plain_text).encode('utf-8')
-        
-        key = key_bytes
-        iv = iv_str.encode('utf-8')
-        
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        encrypted = cipher.encrypt(pad(plain, AES.block_size))
-        return base64.b64encode(encrypted).decode()
-    
-    @staticmethod
-    def encrypt_payload(payload: str, piece_data: bytes) -> str:
-        """加密轨迹数据 - 对应 XDYou 的 _encryptPayload"""
-        key_bytes = piece_data[-16:]  # 最后16字节作为密钥
-        return SliderCaptchaSolver.aes_encrypt(payload, key_bytes)
-    
-    @staticmethod
-    def generate_tracks(target_x: int) -> List[Dict]:
-        """
-        生成模拟人类拖拽轨迹
-        对应 XDYou 的 generateTracks(targetX)
-        """
-        tracks = []
-        current_x = 0
-        current_y = 0
-        
-        # 起始点
-        tracks.append({"a": 0, "b": 0, "c": 0})
-        
-        while current_x < target_x:
-            remaining = target_x - current_x
-            step_x = random.randint(5, 9) if remaining > 20 else random.randint(1, 3)
-            current_x += step_x
-            if current_x > target_x:
-                current_x = target_x
-            
-            if random.random() > 0.7:
-                current_y += 1 if random.random() > 0.5 else -1
-            
-            step_time = 20 + random.randint(0, 5)
-            tracks.append({"a": current_x, "b": current_y, "c": step_time})
-            
-            if current_x == target_x:
-                break
-        
-        # 结束停留点
-        tracks.append({"a": target_x, "b": current_y, "c": 20 + random.randint(0, 9)})
-        return tracks
-    
-    @staticmethod
-    async def solve_captcha(client: httpx.AsyncClient) -> bool:
-        """
-        自动破解滑块验证码
-        1. 获取验证码图片
-        2. 从 tagWidth 获取正确偏移量
-        3. 生成轨迹
-        4. AES 加密
-        5. 提交验证
-        """
-        import time
-        ts = int(time.time() * 1000)
-        
-        # 1. 获取验证码图片 (use client's cookies automatically)
-        r = await client.get(
-            f"{IDS_BASE}/authserver/common/openSliderCaptcha.htl",
-            params={'_': ts},
-        )
-        data = r.json()
-        big_img = base64.b64decode(data["bigImage"])
-        small_img = base64.b64decode(data["smallImage"])
-        
-        # tagWidth 是正确偏移量
-        tag_width = int(float(data.get("tagWidth", 0)))
-        print(f"[captcha] tagWidth={tag_width}")
-        
-        # 2. 生成轨迹
-        tracks = SliderCaptchaSolver.generate_tracks(tag_width)
-        
-        # 3. 加密 payload
-        payload = json.dumps({
-            "canvasLength": 280,
-            "moveLength": tag_width,
-            "tracks": tracks,
-        }, separators=(',', ':'))
-        
-        sign = SliderCaptchaSolver.encrypt_payload(payload, small_img)
-        
-        # 4. 提交验证 (use client cookies automatically)
-        verify_headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "Origin": IDS_BASE,
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        r = await client.post(
-            f"{IDS_BASE}/authserver/common/verifySliderCaptcha.htl",
-            data=f"sign={urllib.parse.quote(sign, safe="")}",
-            headers=verify_headers,
-        )
-        result = r.json()
-        success = result.get("errorCode") == 1
-        print(f"[captcha] verify result: {result}")
-        return success
-
 # ─── Cookie 管理 ─────────────────────────────────
 
 def load_cookies() -> dict:
@@ -376,101 +245,11 @@ def extract_ehall_cookies(client: httpx.AsyncClient) -> dict:
 
 async def cas_login(client: httpx.AsyncClient) -> bool:
     """
-    通过 IDS CAS 登录 ehall，含自动滑块验证码破解
+    通过 IDS CAS 登录 ehall（已禁用，滑块无法自动破解）
+    请用 Mac Chrome 手动登录后导入 Cookie
     """
-    username = os.environ.get("XDU_USERNAME", DEFAULT_XH)
-    password = os.environ.get("XDU_PASSWORD", DEFAULT_PW)
-    if not password:
-        print("[login] No password configured, can't auto-login")
-        return False
-    
-    target = "https://ehall.xidian.edu.cn/login?service=https://ehall.xidian.edu.cn/new/index.html"
-    
-    try:
-        # 1. 获取登录页面
-        print("[login] Fetching login page...")
-        r = await client.get(f"{IDS_BASE}/authserver/login", params={"service": target})
-        page = r.text
-        
-        from html.parser import HTMLParser
-        
-        class FormParser(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.fields = {}
-                self.in_form = False
-            def handle_starttag(self, tag, attrs):
-                d = dict(attrs)
-                if tag == "input" and d.get("type") == "hidden" and d.get("name") and d.get("value"):
-                    self.fields[d["name"]] = d["value"]
-                if tag == "input" and d.get("id") == "pwdEncryptSalt" and d.get("value"):
-                    self.fields["pwdEncryptSalt"] = d["value"]
-        
-        fp = FormParser()
-        fp.feed(page)
-        
-        # 获取加密密钥
-        keys = fp.fields.get("pwdEncryptSalt", "")
-        print(f"[login] encrypt key: {keys}")
-        
-        # 2. AES 加密密码 (XDYou 的 aesEncrypt)
-        prefix = "xidianscriptsxduxidianscriptsxduxidianscriptsxduxidianscriptsxdu"
-        to_enc = (prefix + password).encode()
-        
-        # PKCS7 padding
-        block_size = 16
-        padding_len = block_size - len(to_enc) % block_size
-        to_enc += bytes([padding_len] * padding_len)
-        
-        cipher = AES.new(keys.encode(), AES.MODE_CBC, iv=b'xidianscriptsxdu')
-        pwd_enc = base64.b64encode(cipher.encrypt(to_enc)).decode()
-        
-        # 3. 获取验证码并自动破解
-        print("[login] Solving captcha...")
-        success = await SliderCaptchaSolver.solve_captcha(client)
-        if not success:
-            print("[login] Captcha solve failed")
-            return False
-        print("[login] Captcha solved!")
-        
-        # 4. 提交登录
-        login_data = {
-            'username': username,
-            'password': pwd_enc,
-            'rememberMe': 'true',
-            'cllt': 'userNameLogin',
-            'dllt': 'generalLogin',
-            '_eventId': 'submit',
-        }
-        for key in ['lt', 'execution']:
-            if key in fp.fields:
-                login_data[key] = fp.fields[key]
-        
-        print("[login] Submitting login...")
-        r = await client.post(
-            f"{IDS_BASE}/authserver/login",
-            params={"service": target},
-            data=login_data,
-            follow_redirects=False,
-        )
-        
-        if r.status_code == 302:
-            loc = r.headers.get("location", "")
-            print(f"[login] Redirect: {loc}")
-            # 跟随重定向
-            await client.get(loc)
-            
-            # 保存 cookies
-            save_cookies(extract_ehall_cookies(client))
-            return True
-        else:
-            print(f"[login] Failed with status {r.status_code}")
-            return False
-            
-    except Exception as e:
-        print(f"[login] Error: {e}")
-        return False
-
+    print("[login] Auto-login disabled, use Mac to import cookies")
+    return False
 # ─── FastAPI ──────────────────────────────────────
 
 app = FastAPI(title="XDU 课表 API", version="2.0.0")
@@ -516,7 +295,7 @@ async def set_cookies(data: CookieInput):
 
 @app.post("/api/login")
 async def login(data: LoginInput):
-    """尝试自动 CAS 登录（含滑块验证码破解）"""
+    """滑块验证码无法自动破解，此端点已禁用，请用 Mac 导入 Cookie"""
     os.environ["XDU_USERNAME"] = data.username
     if data.password:
         os.environ["XDU_PASSWORD"] = data.password
@@ -630,6 +409,40 @@ async def chaoxing_course_detail(course_id: str):
                 break
         
         return result
+    finally:
+        await client.aclose()
+
+
+@app.get("/api/chaoxing/course/{course_id}/chapters")
+async def chaoxing_course_chapters(course_id: str):
+    """课程章节列表"""
+    client = make_cx_client()
+    try:
+        cx = load_cx_cache()
+        course_info = {}
+        for c in (cx.get("courses", []) if isinstance(cx.get("courses"), list) else cx.get("courses", {}).values()):
+            if isinstance(c, dict) and c.get("courseId") == course_id:
+                course_info = c
+                break
+
+        clazz_id = course_info.get("clazzId", "")
+        chapters = []
+
+        if clazz_id:
+            try:
+                r = await client.get(
+                    f"https://mooc1-1.chaoxing.com/visit/stucoursemiddle?courseid={course_id}&clazzid={clazz_id}&vc=1&cpi=482265202",
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    timeout=8.0,
+                )
+                html = r.text
+                if html and "温馨提示" not in html:
+                    for m in re.finditer(r'chapterId=(\d+)[^>]*aria-label="([^"]+)"', html):
+                        chapters.append({"chapterId": m.group(1), "name": m.group(2)})
+            except Exception as e:
+                print(f"[chaoxing] chapters fetch error: {e}")
+
+        return {"courseId": course_id, "name": course_info.get("courseName", ""), "chapters": chapters, "chapterCount": len(chapters)}
     finally:
         await client.aclose()
 
